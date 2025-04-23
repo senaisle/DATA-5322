@@ -1,0 +1,412 @@
+---
+title: "Youth Drug Use"
+author: "Tyler Franck"
+date: "2025-04-14"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+library(tidyverse)
+library(ROCR)
+library(caret)
+library(tree)
+library(randomForest)
+library(gbm)
+```
+
+```{r}
+# plot ROC curve for given predicted and truth values
+rocplot <- function(pred, truth, ...) {
+  pred_obj <- prediction(pred, truth)
+  perf_obj <- performance(pred_obj, "tpr", "fpr")
+  plot(perf_obj, ...)
+}
+```
+
+# 1. The Data
+
+We will explore youth drug use using a [filtered verson](https://github.com/mendible/5322/tree/main/Homework%201) of the [2023 National Survey on Drug Use and Health](https://www.samhsa.gov/data/dataset/national-survey-drug-use-and-health-2023-nsduh-2023-ds0001). Detailed documentation can be found in the codebook on the NSDUH site, but the comments in the `YouthParse.R` file are more accessible though incomplete. In summary, the data includes:
+
+- For alcohol, marijuana, and cigarettes:
+  - frequency of use over the last year/month
+  - age of first use
+  - have/have not used ever
+  - imputed categories for drug frequency (e.g. 1-2 days, 3-5 days, 6-10 days)
+- Basic demographics like sex, race, household income
+- Youth-specific demographics like parental presence in the household and school attendance
+
+```{r}
+load("data/youth_data.Rdata")
+df[1:3,]
+```
+
+```{r}
+# columns related to substance use
+substance_cols
+```
+
+```{r}
+# columns related to youth demographics
+demographic_cols
+```
+
+```{r}
+# columns related to youth experience
+youth_experience_cols
+```
+
+# 2. The Question
+
+We are tasked with investigating the factors that correlate with youth drug usage. In particular, we will try to answer the following question: *Which demographic, behavioral, and social factors best predict ongoing* drug usage, and do these predictors differ for alcohol, marijuana, and cigarettes? As per the assignment specification, we must include an example of binary classification, multi-class classification, and regression, and so we will apply each to one of alcohol, marijuana, and cigarette usage.
+
+```{r}
+# non-substance related columns (this is just convenient because we always use these as predictors)
+df_non_substance <- cbind(df[,demographic_cols],df[,youth_experience_cols])
+```
+
+# 3. Modeling
+
+## 3.1 Alcohol (Binary)
+
+We want to find the predictors that best track ongoing alcohol usage, for which we will use a binary variable that indicates whether or not they've used alcohol in the past 30 days. We need to be careful to exclude "equivalent" variables from our analysis (e.g., we shouldn't try to predict binary usage with the *number of times* they've use it).
+
+```{r}
+alcohol <- df_non_substance
+
+# IRALCFM = 91 (never used alcohol), 93 (didn't use in past month)
+alcohol[,"ALCOHOL"] <- factor(ifelse(df[,"IRALCFM"]<91,1,0))
+
+alcohol[1:3,]
+```
+
+```{r}
+set.seed(5322)
+
+# 75/25 train/test split
+train <- sample(1:nrow(alcohol), 0.75*nrow(alcohol))
+test <- -(train)
+alcohol.train <- alcohol[train,]
+alcohol.test <- alcohol[test,]
+```
+
+### 3.1.1 Decision Tree
+
+```{r}
+tree.alcohol <- tree(ALCOHOL ~ ., alcohol.train)
+summary(tree.alcohol)
+plot(tree.alcohol)
+text(tree.alcohol,pretty=0)
+```
+
+That the decision tree just predicts the most common response might be evidence that none of the predictors are particularly useful, though we
+will hold off on making this conclusion. At least this gives us chance to get the base-line metrics of a model that just guesses the most common response:
+
+```{r}
+y_pred <- predict(tree.alcohol,alcohol.test,type="class")
+truth <- alcohol.test$ALCOHOL
+
+print(caret::confusionMatrix(table(y_pred,truth)))
+rocplot(as.numeric(y_pred),truth, col="red")  # base-line "y=x" as you'd expect
+```
+
+### 3.2.2 Bagging
+
+The `randomForest` function doesn't work with missing values, and so we must either impute these values or drop them. For simplicity, we will just drop them, though this could bias our results.
+
+```{r}
+# effect across train and test sets should be consistent due to random sampling
+alcohol.train.nna <- na.omit(alcohol.train)  # 7920 -> 6213 rows
+alcohol.test.nna <- na.omit(alcohol.test)    # 2641 -> 2036 rows
+```
+
+```{r}
+# number of predictors
+p <- ncol(alcohol)-1
+p
+```
+
+```{r}
+set.seed(5322)
+
+bag.alcohol <- randomForest(
+  ALCOHOL ~ .,
+  alcohol.train.nna,
+  mtry=p,
+  importance=TRUE
+)
+bag.alcohol
+```
+
+```{r}
+# for future reference, ~100 trees is probably enough
+plot(
+  x=1:bag.alcohol$ntree,
+  xlab="Number of Trees",
+  y=bag.alcohol$err.rate[,"OOB"],
+  ylab="OOB Error"
+)
+```
+
+```{r}
+# Is our model actually useful?
+y_pred <- predict(bag.alcohol,alcohol.test.nna,type="class")
+truth <- alcohol.test.nna$ALCOHOL
+
+print(caret::confusionMatrix(table(y_pred,truth)))
+rocplot(as.numeric(y_pred),truth, col="red")  # base-line "y=x" as you'd expect
+abline(0,1)
+```
+
+Our model is performing *slightly* better than just guessing the most common response! Let's see which predictors it thinks are most important:
+
+```{r}
+# Variable importance plots
+importance(bag.alcohol)
+varImpPlot(bag.alcohol)
+```
+
+The three most important predictors are:
+
+- `YFLMJMO`: How youth feels about peer marijuana usage
+- `STNDALC`: Peer alcohol consumption
+- `INCOME`: Family income
+
+## 3.2 Marijuana (Multi-class)
+
+```{r}
+marijuana <- df_non_substance
+
+# # days used in past month (0=none, 1=1-2, 2=3-5, 3=6-19, 4=20-30)
+marijuana$MARIJUANA <- df$MRJMDAYS
+marijuana[marijuana$MARIJUANA==5,"MARIJUANA"] <- 0  # change 5=none to 0=none
+marijuana$MARIJUANA <- factor(marijuana$MARIJUANA)
+marijuana[1:3,]
+```
+
+```{r}
+set.seed(5322)
+
+# 75/25 train/test split
+train <- sample(1:nrow(marijuana), 0.75*nrow(marijuana))
+test <- -(train)
+marijuana.train <- marijuana[train,]
+marijuana.test <- marijuana[test,]
+```
+
+### 3.2.1 Decision Tree
+
+```{r}
+tree.marijuana <- tree(MARIJUANA ~ ., marijuana.train)
+summary(tree.marijuana)
+plot(tree.marijuana)
+text(tree.marijuana,pretty=0)
+```
+
+```{r}
+# tree is pretty complex, let's try pruning
+cv.marijuana <- cv.tree(tree.marijuana)
+plot(cv.marijuana$size, cv.marijuana$dev, type = "b")
+```
+
+```{r}
+# size = 3 looks like a good choice
+prune.marijuana <- prune.misclass(tree.marijuana, best = 3)
+plot(prune.marijuana)
+text(prune.marijuana, pretty = 0)
+```
+
+```{r}
+y_pred <- predict(prune.marijuana,marijuana.test,type="class")
+truth <- marijuana.test$MARIJUANA
+
+print(caret::confusionMatrix(table(y_pred,truth)))
+```
+Our model seems to be capturing something about the least and most frequent users, but nothing about the middle frequencies (it never predicts 1-3). But being able to identify heavy usage is still useful. It gets this predictive power from the following predictors:
+
+- `FRDMJMON`: how close friends feel about marijuana
+- `YOSELL2`: whether youth sells illegal drugs
+
+### 3.2.2 Random Forest
+
+```{r}
+# effect across train and test sets should be consistent due to random sampling
+marijuana.train.nna <- na.omit(marijuana.train)  # 7920 > 6213 rows
+marijuana.test.nna <- na.omit(marijuana.test)    # 2641 > 2036 rows
+```
+
+```{r}
+# number of predictors
+p <- ncol(marijuana)-1
+p
+```
+
+```{r}
+set.seed(5322)
+
+ms <- 2*(1:(p/6))  # try up to p/3 predictors (skipping by 2 for quicker compute)
+accuracy <- rep(0,length(ms))  # validation accuracy
+for (i in 1:length(ms)) {
+  # train model and get validation accuracy of current m
+  rf.marijuana.nna <- randomForest(MARIJUANA ~ ., marijuana.train.nna, mtry=ms[i])
+  accuracy[i] <- mean(predict(rf.marijuana.nna,marijuana.test.nna,type="class")==marijuana.test.nna$MARIJUANA)
+}
+plot(
+  x=ms,
+  xlab="Number of Variables",
+  y=accuracy,
+  ylab="Test Accuracy"
+)
+```
+
+```{r}
+set.seed(5322)
+
+# m = 10 seems like a good choice
+m <- 10
+rf.marijuana <- randomForest(MARIJUANA ~ ., marijuana.train.nna, mtry=m, importance=TRUE)
+rf.marijuana
+```
+
+```{r}
+# How does it perform?
+y_pred <- predict(rf.marijuana,marijuana.test.nna,type="class")
+truth <- marijuana.test.nna$MARIJUANA
+
+print(caret::confusionMatrix(table(y_pred,truth)))
+```
+
+Like the decision tree, the random forest achieves non-trivial balanced accuracy for the lowest and highest frequencies, so looking at the variable importance is meaningful.
+
+```{r}
+# variable importance plots
+importance(rf.marijuana)
+varImpPlot(rf.marijuana)
+```
+
+Some promising predictors are:
+
+- `YOSELL2`: Whether youth has sold illegal drugs
+- `PRMJMO`: How (youth thinks) parents would feel about them using marijuana (monthly)
+- `INCOME`: Family income
+- `YFLTMRJ2`: How youth feels about peers trying marijuana
+
+# 3.3 Cigarette (Regression)
+
+```{r}
+cigarette <- df_non_substance
+
+# # days used in past month
+cigarette$CIGARETTE <- df$IRCIGFM
+cigarette[cigarette$CIGARETTE>90,"CIGARETTE"] <- 0  # change the "none" values (>90) to 0
+cigarette[1:3,]
+```
+
+```{r}
+set.seed(5322)
+
+# 75/25 train/test split
+train <- sample(1:nrow(cigarette), 0.75*nrow(cigarette))
+test <- -(train)
+cigarette.train <- cigarette[train,]
+cigarette.test <- cigarette[test,]
+```
+
+### 3.3.1 Decision Tree
+
+```{r}
+tree.cigarette <- tree(CIGARETTE ~ ., cigarette.train)
+summary(tree.cigarette)
+plot(tree.cigarette)
+text(tree.cigarette,pretty=0)
+```
+
+Attempts to prune tree were not successful, so we just stick with this complex, but manageable tree.
+
+```{r}
+# How does it perform?
+
+# MSE if we just guess the mean value
+ mean((cigarette.test$CIGARETTE-mean(cigarette.test$CIGARETTE))^2)
+
+# model test MSE
+pred <- predict(tree.cigarette,cigarette.test)
+mean((pred-cigarette.test$CIGARETTE)^2)
+```
+
+Our model performs worse than if we just guess the mean value... Can't really saying anything about predictor importance.
+
+### 3.3.2 Boosting
+
+```{r}
+set.seed(5322)
+
+B <- c(100, 500, 1000)    # number of trees
+d <- c(1,2)               # interaction depth
+s <- c(0.1,0.01,0.001)    # shrinkage
+test.MSE <- rep(0,3*2*3)  # validation scores
+grid <- crossing(B,d,s,test.MSE)
+for (i in 1:nrow(grid)) {
+  # train model with corresponding B, d, and s
+  boost.cigarette <- gbm(
+    CIGARETTE ~ ., cigarette.train,
+    distribution="gaussian",
+    n.trees=grid[i,"B"],
+    interaction.depth=grid[i,"d"],
+    shrinkage=grid[i,"s"],
+    verbose=FALSE
+  )
+  
+  # measure validation score
+  pred <- predict(boost.cigarette,cigarette.test, n.trees=grid[i,]$B)
+  grid[i,"test.MSE"] <- mean((pred-cigarette.test$CIGARETTE)^2)
+}
+grid
+```
+
+```{r}
+set.seed(5322)
+
+# use best parameter settings
+boost.cigarette <- gbm(
+  CIGARETTE ~ ., cigarette.train,
+  distribution="gaussian",
+  n.trees=100,
+  interaction.depth=1,
+  shrinkage=0.01,
+  verbose=FALSE
+)
+```
+
+```{r}
+# How does it perform?
+
+# base-line mse
+base.mse <- mean((cigarette.test$CIGARETTE-mean(cigarette.test$CIGARETTE))^2)
+base.mse
+
+# model test MSE
+pred <- predict(boost.cigarette,cigarette.test)
+model.mse <- mean((pred-cigarette.test$CIGARETTE)^2)
+model.mse
+
+# reduction in MSE (can think of this as % of data explained)
+1-model.mse/base.mse
+```
+
+Model beats the null model (just barely), and so it makes sense to look at the relative influence:
+
+```{r}
+# variable relative influence
+summary(boost.cigarette)
+```
+
+Sharing some overlap with the decision tree, the the following predictors seem to be the most important: in order,
+
+- `YOSTOLE2`: Youth stole or tried to steal and item more expensive than \$50
+- `YFLPKCG2`: How youth feels about peers smoking
+- `YOSELL2`: Has youth sold illegal drugs
+- `EDUSCHLGO`: Is the youth going to school
+- `PRPKCIG2`: How youth thinks their parents feel about them smoking 1+ pack a day
